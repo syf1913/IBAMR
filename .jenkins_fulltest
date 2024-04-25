@@ -1,0 +1,35 @@
+#!/bin/bash
+set -e
+set -o pipefail
+
+# export the following environment variables
+# before executing this script in the jenkins
+# execute shell
+
+config() {
+    ./configure \
+        CFLAGS="$CFLAGS" \
+        CXXFLAGS="$CXXFLAGS" \
+        FCFLAGS="$FCFLAGS" \
+        CC=$MPICC \
+        CXX=$MPICXX \
+        FC=$MPIFC \
+        CPPFLAGS="$CPPFLAGS" \
+        --with-hypre=$PETSC_DIR/$PETSC_ARCH \
+        --with-samrai=$SAMRAI_DIR \
+        --with-hdf5=$HDF5_DIR \
+        --with-silo=$SILO_DIR \
+        --with-boost=$BOOST_DIR \
+        --enable-libmesh \
+        --with-libmesh=$LIBMESH_DIR \
+        --with-libmesh-method=$LIBMESH_METHOD \
+        --enable-gsl \
+        --with-gsl=$GSL_DIR \
+        --enable-gtest \
+        --with-gtest=$GTEST_DIR
+}
+
+config
+make -kj4 lib
+cd examples
+make gtest-long

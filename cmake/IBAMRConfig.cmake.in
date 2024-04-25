@@ -1,0 +1,127 @@
+## ---------------------------------------------------------------------
+##
+## Copyright (c) 2020 - 2021 by the IBAMR developers
+## All rights reserved.
+##
+## This file is part of IBAMR.
+##
+## IBAMR is free software and is distributed under the 3-clause BSD
+## license. The full text of the license can be found in the file
+## COPYRIGHT at the top level directory of IBAMR.
+##
+## ---------------------------------------------------------------------
+
+# This file is a template populated by CMake with the actual locations of
+# external dependencies and also the file containing information on IBAMR's own
+# targets.
+@PACKAGE_INIT@
+
+# Don't set compiler flags, but save them. If we are using default flags (i.e.,
+# CMAKE_BUILD_TYPE was set but CMAKE_CXX_FLAGS was not) then save those flags
+# instead
+IF("@CMAKE_C_FLAGS@" STREQUAL "")
+  IF("@CMAKE_BUILD_TYPE@" STREQUAL "Release")
+    SET(IBAMR_C_FLAGS "@CMAKE_C_FLAGS_RELEASE@")
+  ELSEIF("@CMAKE_BUILD_TYPE@" STREQUAL "Debug")
+    SET(IBAMR_C_FLAGS "@CMAKE_C_FLAGS_DEBUG@")
+  ENDIF()
+ELSE()
+  SET(IBAMR_C_FLAGS "@CMAKE_C_FLAGS@")
+ENDIF()
+
+IF("@CMAKE_CXX_FLAGS@" STREQUAL "")
+  IF("@CMAKE_BUILD_TYPE@" STREQUAL "Release")
+    SET(IBAMR_CXX_FLAGS "@CMAKE_CXX_FLAGS_RELEASE@")
+  ELSEIF("@CMAKE_BUILD_TYPE@" STREQUAL "Debug")
+    SET(IBAMR_CXX_FLAGS "@CMAKE_CXX_FLAGS_DEBUG@")
+  ENDIF()
+ELSE()
+  SET(IBAMR_CXX_FLAGS "@CMAKE_CXX_FLAGS@")
+ENDIF()
+
+IF("@CMAKE_Fortran_FLAGS@" STREQUAL "")
+  IF("@CMAKE_BUILD_TYPE@" STREQUAL "Release")
+    SET(IBAMR_Fortran_FLAGS "@CMAKE_Fortran_FLAGS_RELEASE@")
+  ELSEIF("@CMAKE_BUILD_TYPE@" STREQUAL "Debug")
+    SET(IBAMR_Fortran_FLAGS "@CMAKE_Fortran_FLAGS_DEBUG@")
+  ENDIF()
+ELSE()
+  SET(IBAMR_Fortran_FLAGS "@CMAKE_Fortran_FLAGS@")
+ENDIF()
+
+IF(NOT "@MPI_ROOT@" STREQUAL "")
+  # CMake wants to detect MPI with MPI_HOME, not MPI_ROOT (which we set up)
+  SET(MPI_HOME "@MPI_ROOT@")
+ENDIF()
+FIND_PACKAGE(MPI REQUIRED COMPONENTS C CXX)
+
+IF(NOT @IBAMR_USE_BUNDLED_BOOST@)
+  SET(Boost_ROOT "@BOOST_ROOT@")
+  IF(@USER_PROVIDED_BOOST_ROOT@)
+    SET(Boost_NO_SYSTEM_PATHS ON)
+    # Modern versions of Boost install some extra files which we want to ignore
+    # since they are incompatible with Boost_NO_SYSTEM_PATHS. If we don't set
+    # this then CMake will set us up with a system copy of boost even when
+    # Boost_ROOT is something else
+    #
+    # This was fixed in CMake in 3.19: see
+    # https://gitlab.kitware.com/cmake/cmake/-/issues/21200
+    IF(${CMAKE_VERSION} VERSION_LESS "3.19.0")
+      SET(Boost_NO_BOOST_CMAKE ON)
+    ENDIF()
+  ENDIF()
+  FIND_PACKAGE(Boost 1.57 REQUIRED)
+
+  # We do not want to set BOOST_ALL_NO_LIB in case IBAMR is linked to other
+  # libraries that *do* link against boost libraries
+  GET_TARGET_PROPERTY(_boost_definitions Boost::headers
+    INTERFACE_COMPILE_DEFINITIONS)
+  # Deal with both cases of _boost_definitions not being found
+  IF(NOT "${_boost_definitions}" STREQUAL "_boost_definitions-NOTFOUND" AND
+     NOT "${_boost_definitions}" STREQUAL "")
+    LIST(REMOVE_ITEM _boost_definitions "BOOST_ALL_NO_LIB")
+    SET_TARGET_PROPERTIES(Boost::headers PROPERTIES INTERFACE_COMPILE_DEFINITIONS
+      "${_boost_definitions}")
+  ENDIF()
+ENDIF()
+
+IF(NOT @IBAMR_USE_BUNDLED_EIGEN3@)
+  SET(Eigen3_ROOT "@EIGEN3_ROOT@")
+  FIND_PACKAGE(Eigen3 3.2.5 REQUIRED)
+ENDIF()
+
+# non-bundled muParser is not handled as a package so we don't set it up again
+# here
+
+# Our linkage with SILO is purely internal and none of our headers include
+# silo.h so we do not handle it as an externally-facing dependency here.
+
+SET(HDF5_ROOT "@HDF5_ROOT@")
+FIND_PACKAGE(HDF5 REQUIRED)
+
+INCLUDE(${CMAKE_CURRENT_LIST_DIR}/IBAMRTargets.cmake)
+
+# Attempt to avoid conflicts between potential system copies of bundled
+# dependencies and the actual bundled dependencies by putting their include
+# directories at the front:
+
+IF(@IBAMR_USE_BUNDLED_BOOST@)
+  GET_TARGET_PROPERTY(_boost_includes IBAMR::BUNDLED_BOOST
+    INTERFACE_INCLUDE_DIRECTORIES)
+  TARGET_INCLUDE_DIRECTORIES(IBAMR::IBTK2d BEFORE INTERFACE "${_boost_includes}")
+  TARGET_INCLUDE_DIRECTORIES(IBAMR::IBTK3d BEFORE INTERFACE "${_boost_includes}")
+ENDIF()
+
+IF(@IBAMR_USE_BUNDLED_EIGEN3@)
+  GET_TARGET_PROPERTY(_eigen3_includes IBAMR::BUNDLED_EIGEN3
+    INTERFACE_INCLUDE_DIRECTORIES)
+  TARGET_INCLUDE_DIRECTORIES(IBAMR::IBTK2d BEFORE INTERFACE "${_eigen3_includes}")
+  TARGET_INCLUDE_DIRECTORIES(IBAMR::IBTK3d BEFORE INTERFACE "${_eigen3_includes}")
+ENDIF()
+
+IF(@IBAMR_USE_BUNDLED_MUPARSER@)
+  GET_TARGET_PROPERTY(_muparser_includes IBAMR::BUNDLED_MUPARSER
+    INTERFACE_INCLUDE_DIRECTORIES)
+  TARGET_INCLUDE_DIRECTORIES(IBAMR::IBTK2d BEFORE INTERFACE "${_muparser_includes}")
+  TARGET_INCLUDE_DIRECTORIES(IBAMR::IBTK3d BEFORE INTERFACE "${_muparser_includes}")
+ENDIF()

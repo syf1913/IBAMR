@@ -1,0 +1,826 @@
+// ---------------------------------------------------------------------
+//
+// Copyright (c) 2015 - 2020 by the IBAMR developers
+// All rights reserved.
+//
+// This file is part of IBAMR.
+//
+// IBAMR is free software and is distributed under the 3-clause BSD
+// license. The full text of the license can be found in the file
+// COPYRIGHT at the top level directory of IBAMR.
+//
+// ---------------------------------------------------------------------
+
+/////////////////////////////// INCLUDES /////////////////////////////////////
+
+#include "ibamr/StaggeredStokesIBLevelRelaxationFACOperator.h"
+#include "ibamr/StaggeredStokesPETScLevelSolver.h"
+#include "ibamr/StaggeredStokesPETScMatUtilities.h"
+#include "ibamr/StaggeredStokesPETScVecUtilities.h"
+#include "ibamr/StaggeredStokesPhysicalBoundaryHelper.h"
+#include "ibamr/StaggeredStokesSolver.h"
+#include "ibamr/StaggeredStokesSolverManager.h"
+
+#include "ibtk/CoarseFineBoundaryRefinePatchStrategy.h"
+#include "ibtk/IBTK_CHKERRQ.h"
+#include "ibtk/IBTK_MPI.h"
+#include "ibtk/PETScMatUtilities.h"
+
+#include "ArrayData.h"
+#include "Box.h"
+#include "BoxList.h"
+#include "CartesianGridGeometry.h"
+#include "CellData.h"
+#include "CellVariable.h"
+#include "IntVector.h"
+#include "MultiblockDataTranslator.h"
+#include "Patch.h"
+#include "PatchHierarchy.h"
+#include "PatchLevel.h"
+#include "ProcessorMapping.h"
+#include "RefineSchedule.h"
+#include "SAMRAIVectorReal.h"
+#include "SideData.h"
+#include "SideGeometry.h"
+#include "SideVariable.h"
+#include "Variable.h"
+#include "VariableContext.h"
+#include "VariableDatabase.h"
+#include "tbox/Array.h"
+#include "tbox/Database.h"
+#include "tbox/Pointer.h"
+#include "tbox/Utilities.h"
+
+#include "petscksp.h"
+#include <petsclog.h>
+
+#include <algorithm>
+#include <cstring>
+#include <limits>
+#include <memory>
+#include <ostream>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "ibamr/namespaces.h" // IWYU pragma: keep
+
+/////////////////////////////// NAMESPACE ////////////////////////////////////
+
+namespace IBAMR
+{
+/////////////////////////////// STATIC ///////////////////////////////////////
+
+namespace
+{
+// Ghost cell width for pressure
+static const int SIDEG = 1;
+static const int CELLG = 1;
+static const int NOGHOST = 0;
+} // namespace
+
+/////////////////////////////// PUBLIC ///////////////////////////////////////
+
+StaggeredStokesIBLevelRelaxationFACOperator::StaggeredStokesIBLevelRelaxationFACOperator(
+    std::string object_name,
+    const Pointer<Database> input_db,
+    const std::string& default_options_prefix)
+    : StaggeredStokesFACPreconditionerStrategy(std::move(object_name),
+                                               std::max(SIDEG, CELLG),
+                                               input_db,
+                                               default_options_prefix),
+      d_res_rediscretized_stokes(d_rediscretize_stokes),
+      d_level_solver_default_options_prefix(default_options_prefix + "level_")
+{
+    // Set the time stepping type to UNKNOWN to ensure that the IB solver sets it correctly.
+    d_time_stepping_type = UNKNOWN_TIME_STEPPING_TYPE;
+
+    // Indicate that this subclass handles initializaing the coarse-grid solver.
+    d_coarse_solver_init_subclass = true;
+
+    // Get values from the input database.
+    if (input_db)
+    {
+        if (input_db->keyExists("rediscretize_stokes"))
+            d_rediscretize_stokes = input_db->getBool("rediscretize_stokes");
+        if (input_db->keyExists("res_rediscretized_stokes"))
+            d_res_rediscretized_stokes = input_db->getBool("res_rediscretized_stokes");
+        if (input_db->keyExists("level_solver_type")) d_level_solver_type = input_db->getString("level_solver_type");
+        if (input_db->keyExists("level_solver_rel_residual_tol"))
+            d_level_solver_rel_residual_tol = input_db->getDouble("level_solver_rel_residual_tol");
+        if (input_db->keyExists("level_solver_abs_residual_tol"))
+            d_level_solver_abs_residual_tol = input_db->getDouble("level_solver_abs_residual_tol");
+        if (input_db->keyExists("level_solver_max_iterations"))
+            d_level_solver_max_iterations = input_db->getInteger("level_solver_max_iterations");
+        if (input_db->keyExists("SAJ_fill")) d_SAJ_fill = input_db->getDouble("SAJ_fill");
+        if (input_db->keyExists("RStokesIBP_fill")) d_RStokesIBP_fill = input_db->getDouble("RStokesIBP_fill");
+        if (input_db->isDatabase("level_solver_db"))
+        {
+            d_level_solver_db = input_db->getDatabase("level_solver_db");
+        }
+        if (input_db->keyExists("U_petsc_prolongation_method"))
+            d_u_petsc_prolongation_method = input_db->getString("U_petsc_prolongation_method");
+        if (input_db->keyExists("u_petsc_prolongation_method"))
+            d_u_petsc_prolongation_method = input_db->getString("u_petsc_prolongation_method");
+        if (input_db->keyExists("P_petsc_prolongation_method"))
+            d_p_petsc_prolongation_method = input_db->getString("P_petsc_prolongation_method");
+        if (input_db->keyExists("p_petsc_prolongation_method"))
+            d_p_petsc_prolongation_method = input_db->getString("p_petsc_prolongation_method");
+    }
+
+    // Construct the DOF index variable/context.
+    VariableDatabase<NDIM>* var_db = VariableDatabase<NDIM>::getDatabase();
+    d_u_dof_index_var = new SideVariable<NDIM, int>(d_object_name + "::u_dof_index");
+    if (var_db->checkVariableExists(d_u_dof_index_var->getName()))
+    {
+        d_u_dof_index_var = var_db->getVariable(d_u_dof_index_var->getName());
+        d_u_dof_index_idx = var_db->mapVariableAndContextToIndex(d_u_dof_index_var, d_context);
+        var_db->removePatchDataIndex(d_u_dof_index_idx);
+    }
+    d_u_dof_index_idx = var_db->registerVariableAndContext(d_u_dof_index_var, d_context, NOGHOST);
+    d_p_dof_index_var = new CellVariable<NDIM, int>(d_object_name + "::p_dof_index");
+    if (var_db->checkVariableExists(d_p_dof_index_var->getName()))
+    {
+        d_p_dof_index_var = var_db->getVariable(d_p_dof_index_var->getName());
+        d_p_dof_index_idx = var_db->mapVariableAndContextToIndex(d_p_dof_index_var, d_context);
+        var_db->removePatchDataIndex(d_p_dof_index_idx);
+    }
+    d_p_dof_index_idx = var_db->registerVariableAndContext(d_p_dof_index_var, d_context, NOGHOST);
+    return;
+} // StaggeredStokesIBLevelRelaxationFACOperator
+
+StaggeredStokesIBLevelRelaxationFACOperator::~StaggeredStokesIBLevelRelaxationFACOperator()
+{
+    if (d_is_initialized)
+    {
+        deallocateOperatorState();
+    }
+    return;
+} // ~StaggeredStokesIBLevelRelaxationFACOperator
+
+void
+StaggeredStokesIBLevelRelaxationFACOperator::setIBTimeSteppingType(TimeSteppingType time_stepping_type)
+{
+    d_time_stepping_type = time_stepping_type;
+    return;
+} // setIBTimeSteppingType
+
+void
+StaggeredStokesIBLevelRelaxationFACOperator::setIBForceJacobian(Mat& A)
+{
+    if (d_is_initialized)
+    {
+        TBOX_ERROR(d_object_name << "::setIBForceJacobian()\n"
+                                 << "  cannot be called while operator state is initialized" << std::endl);
+    }
+#if !defined(NDEBUG)
+    TBOX_ASSERT(A);
+#endif
+    d_A_mat = A;
+    return;
+} // setIBForceJacobian
+
+void
+StaggeredStokesIBLevelRelaxationFACOperator::setIBInterpOp(Mat& J)
+{
+    if (d_is_initialized)
+    {
+        TBOX_ERROR(d_object_name << "::setIBInterpOp()\n"
+                                 << "  cannot be called while operator state is initialized" << std::endl);
+    }
+#if !defined(NDEBUG)
+    TBOX_ASSERT(J);
+#endif
+    d_J_mat = J;
+    return;
+} // setIBInterpOp
+
+Pointer<StaggeredStokesPETScLevelSolver>
+StaggeredStokesIBLevelRelaxationFACOperator::getStaggeredStokesPETScLevelSolver(const int ln) const
+{
+#if !defined(NDEBUG)
+    TBOX_ASSERT(ln >= 0 && ln <= d_finest_ln);
+#endif
+    return d_level_solvers[ln];
+} // getStaggeredStokesIBLevelSolver
+
+Mat
+StaggeredStokesIBLevelRelaxationFACOperator::getEulerianElasticityLevelOp(const int ln) const
+{
+#if !defined(NDEBUG)
+    TBOX_ASSERT(ln >= 0 && ln <= d_finest_ln);
+#endif
+    return d_SAJ_mat[ln];
+} // getEulerianElasticityLevelOp
+
+Mat
+StaggeredStokesIBLevelRelaxationFACOperator::getProlongationOp(const int ln) const
+{
+#if !defined(NDEBUG)
+    TBOX_ASSERT(ln >= 0 && ln < d_finest_ln);
+#endif
+    return d_SAJ_prolongation_mat[ln];
+} // getProlongationOp
+
+Vec
+StaggeredStokesIBLevelRelaxationFACOperator::getRestrictionScalingOp(const int ln) const
+{
+#if !defined(NDEBUG)
+    TBOX_ASSERT(ln >= 0 && ln < d_finest_ln);
+#endif
+    return d_scale_SAJ_restriction_mat[ln];
+} // getRestrictionScalingOp
+
+void
+StaggeredStokesIBLevelRelaxationFACOperator::computeResidual(SAMRAIVectorReal<NDIM, double>& residual,
+                                                             const SAMRAIVectorReal<NDIM, double>& solution,
+                                                             const SAMRAIVectorReal<NDIM, double>& rhs,
+                                                             int coarsest_level_num,
+                                                             int finest_level_num)
+{
+    if (d_res_rediscretized_stokes)
+    {
+        StaggeredStokesFACPreconditionerStrategy::computeResidual(
+            residual, solution, rhs, coarsest_level_num, finest_level_num);
+
+        const int U_res_idx = residual.getComponentDescriptorIndex(0);
+        const int U_sol_idx = solution.getComponentDescriptorIndex(0);
+
+        const int P_res_idx = residual.getComponentDescriptorIndex(1);
+        const int P_sol_idx = solution.getComponentDescriptorIndex(1);
+
+        // Update the residual, r = f - A*u, to include the IB part of the operator.
+        int rank = IBTK_MPI::getRank();
+        for (int ln = coarsest_level_num; ln <= finest_level_num; ++ln)
+        {
+            Vec solution_vec, residual_vec;
+            Pointer<PatchLevel<NDIM> > level = d_hierarchy->getPatchLevel(ln);
+
+            int ierr = VecCreateMPI(PETSC_COMM_WORLD, d_num_dofs_per_proc[ln][rank], PETSC_DETERMINE, &solution_vec);
+            IBTK_CHKERRQ(ierr);
+            ierr = VecCreateMPI(PETSC_COMM_WORLD, d_num_dofs_per_proc[ln][rank], PETSC_DETERMINE, &residual_vec);
+            IBTK_CHKERRQ(ierr);
+
+            StaggeredStokesPETScVecUtilities::copyToPatchLevelVec(
+                solution_vec, U_sol_idx, d_u_dof_index_idx, P_sol_idx, d_p_dof_index_idx, level);
+            StaggeredStokesPETScVecUtilities::copyToPatchLevelVec(
+                residual_vec, U_res_idx, d_u_dof_index_idx, P_res_idx, d_p_dof_index_idx, level);
+
+            ierr = VecScale(residual_vec, -1.0);
+            IBTK_CHKERRQ(ierr);
+            ierr = MatMultAdd(d_SAJ_mat[ln], solution_vec, residual_vec, residual_vec);
+            IBTK_CHKERRQ(ierr);
+            ierr = VecScale(residual_vec, -1.0);
+            IBTK_CHKERRQ(ierr);
+
+            StaggeredStokesPETScVecUtilities::copyFromPatchLevelVec(
+                residual_vec, U_res_idx, d_u_dof_index_idx, P_res_idx, d_p_dof_index_idx, level, nullptr, nullptr);
+            xeqScheduleDataSynch(U_res_idx, ln);
+            xeqScheduleGhostFillNoCoarse(std::make_pair(U_res_idx, P_res_idx), ln);
+
+            ierr = VecDestroy(&solution_vec);
+            IBTK_CHKERRQ(ierr);
+            ierr = VecDestroy(&residual_vec);
+            IBTK_CHKERRQ(ierr);
+        }
+    }
+    else
+    {
+        const int U_res_idx = residual.getComponentDescriptorIndex(0);
+        const int U_sol_idx = solution.getComponentDescriptorIndex(0);
+        const int U_rhs_idx = rhs.getComponentDescriptorIndex(0);
+
+        const int P_res_idx = residual.getComponentDescriptorIndex(1);
+        const int P_sol_idx = solution.getComponentDescriptorIndex(1);
+        const int P_rhs_idx = rhs.getComponentDescriptorIndex(1);
+
+        // Compute the residual, r = f - A*u.
+        int rank = IBTK_MPI::getRank();
+        for (int ln = coarsest_level_num; ln <= finest_level_num; ++ln)
+        {
+            Vec solution_vec;
+            Vec residual_vec;
+            Vec rhs_vec;
+            Pointer<PatchLevel<NDIM> > level = d_hierarchy->getPatchLevel(ln);
+
+            int ierr = VecCreateMPI(PETSC_COMM_WORLD, d_num_dofs_per_proc[ln][rank], PETSC_DETERMINE, &solution_vec);
+            IBTK_CHKERRQ(ierr);
+            ierr = VecCreateMPI(PETSC_COMM_WORLD, d_num_dofs_per_proc[ln][rank], PETSC_DETERMINE, &residual_vec);
+            IBTK_CHKERRQ(ierr);
+            ierr = VecCreateMPI(PETSC_COMM_WORLD, d_num_dofs_per_proc[ln][rank], PETSC_DETERMINE, &rhs_vec);
+            IBTK_CHKERRQ(ierr);
+
+            StaggeredStokesPETScVecUtilities::copyToPatchLevelVec(
+                solution_vec, U_sol_idx, d_u_dof_index_idx, P_sol_idx, d_p_dof_index_idx, level);
+            StaggeredStokesPETScVecUtilities::copyToPatchLevelVec(
+                rhs_vec, U_rhs_idx, d_u_dof_index_idx, P_rhs_idx, d_p_dof_index_idx, level);
+
+            const KSP& level_ksp = d_level_solvers[ln]->getPETScKSP();
+            Mat A;
+            ierr = KSPGetOperators(level_ksp, &A, nullptr);
+            IBTK_CHKERRQ(ierr);
+            ierr = MatMult(A, solution_vec, residual_vec);
+            IBTK_CHKERRQ(ierr);
+            ierr = VecAYPX(residual_vec, -1.0, rhs_vec);
+            IBTK_CHKERRQ(ierr);
+
+            StaggeredStokesPETScVecUtilities::copyFromPatchLevelVec(
+                residual_vec, U_res_idx, d_u_dof_index_idx, P_res_idx, d_p_dof_index_idx, level, nullptr, nullptr);
+            xeqScheduleDataSynch(U_res_idx, ln);
+            xeqScheduleGhostFillNoCoarse(std::make_pair(U_res_idx, P_res_idx), ln);
+
+            ierr = VecDestroy(&solution_vec);
+            IBTK_CHKERRQ(ierr);
+            ierr = VecDestroy(&rhs_vec);
+            IBTK_CHKERRQ(ierr);
+            ierr = VecDestroy(&residual_vec);
+            IBTK_CHKERRQ(ierr);
+        }
+    }
+    return;
+} // computeResidual
+
+void
+StaggeredStokesIBLevelRelaxationFACOperator::smoothError(SAMRAIVectorReal<NDIM, double>& error,
+                                                         const SAMRAIVectorReal<NDIM, double>& residual,
+                                                         int level_num,
+                                                         int num_sweeps,
+                                                         bool /*performing_pre_sweeps*/,
+                                                         bool /*performing_post_sweeps*/)
+{
+    if (num_sweeps == 0) return;
+
+    Pointer<PatchLevel<NDIM> > level = d_hierarchy->getPatchLevel(level_num);
+    const int U_error_idx = error.getComponentDescriptorIndex(0);
+    const int P_error_idx = error.getComponentDescriptorIndex(1);
+    const int U_scratch_idx = d_side_scratch_idx;
+    const int P_scratch_idx = d_cell_scratch_idx;
+
+    Pointer<SAMRAIVectorReal<NDIM, double> > e_level = getLevelSAMRAIVectorReal(error, level_num);
+    Pointer<SAMRAIVectorReal<NDIM, double> > r_level = getLevelSAMRAIVectorReal(residual, level_num);
+
+    // Cache coarse-fine interface ghost cell values in the "scratch" data.
+    if (level_num > d_coarsest_ln && num_sweeps > 1)
+    {
+        int patch_counter = 0;
+        for (PatchLevel<NDIM>::Iterator p(level); p; p++, ++patch_counter)
+        {
+            Pointer<Patch<NDIM> > patch = level->getPatch(p());
+
+            Pointer<SideData<NDIM, double> > U_error_data = error.getComponentPatchData(0, *patch);
+            Pointer<SideData<NDIM, double> > U_scratch_data = patch->getPatchData(U_scratch_idx);
+#if !defined(NDEBUG)
+            const Box<NDIM>& U_ghost_box = U_error_data->getGhostBox();
+            TBOX_ASSERT(U_ghost_box == U_scratch_data->getGhostBox());
+            TBOX_ASSERT(U_error_data->getGhostCellWidth() == SIDEG);
+            TBOX_ASSERT(U_scratch_data->getGhostCellWidth() == SIDEG);
+#endif
+            for (unsigned int axis = 0; axis < NDIM; ++axis)
+            {
+                U_scratch_data->getArrayData(axis).copy(U_error_data->getArrayData(axis),
+                                                        d_patch_side_bc_box_overlap[level_num][patch_counter][axis],
+                                                        IntVector<NDIM>(0));
+            }
+
+            Pointer<CellData<NDIM, double> > P_error_data = error.getComponentPatchData(1, *patch);
+            Pointer<CellData<NDIM, double> > P_scratch_data = patch->getPatchData(P_scratch_idx);
+#if !defined(NDEBUG)
+            const Box<NDIM>& P_ghost_box = P_error_data->getGhostBox();
+            TBOX_ASSERT(P_ghost_box == P_scratch_data->getGhostBox());
+            TBOX_ASSERT(P_error_data->getGhostCellWidth() == CELLG);
+            TBOX_ASSERT(P_scratch_data->getGhostCellWidth() == CELLG);
+#endif
+            P_scratch_data->getArrayData().copy(P_error_data->getArrayData(),
+                                                d_patch_cell_bc_box_overlap[level_num][patch_counter],
+                                                IntVector<NDIM>(0));
+        }
+    }
+
+    // Smooth the error by the specified number of sweeps.
+    for (int isweep = 0; isweep < num_sweeps; ++isweep)
+    {
+        // Re-fill ghost cell data as needed.
+        if (level_num > d_coarsest_ln)
+        {
+            if (isweep > 0)
+            {
+                // Copy the coarse-fine interface ghost cell values which are
+                // cached in the scratch data into the error data.
+                int patch_counter = 0;
+                for (PatchLevel<NDIM>::Iterator p(level); p; p++, ++patch_counter)
+                {
+                    Pointer<Patch<NDIM> > patch = level->getPatch(p());
+
+                    Pointer<SideData<NDIM, double> > U_error_data = error.getComponentPatchData(0, *patch);
+                    Pointer<SideData<NDIM, double> > U_scratch_data = patch->getPatchData(U_scratch_idx);
+                    for (unsigned int axis = 0; axis < NDIM; ++axis)
+                    {
+                        U_error_data->getArrayData(axis).copy(
+                            U_scratch_data->getArrayData(axis),
+                            d_patch_side_bc_box_overlap[level_num][patch_counter][axis],
+                            IntVector<NDIM>(0));
+                    }
+
+                    Pointer<CellData<NDIM, double> > P_error_data = error.getComponentPatchData(1, *patch);
+                    Pointer<CellData<NDIM, double> > P_scratch_data = patch->getPatchData(P_scratch_idx);
+                    P_error_data->getArrayData().copy(P_scratch_data->getArrayData(),
+                                                      d_patch_cell_bc_box_overlap[level_num][patch_counter],
+                                                      IntVector<NDIM>(0));
+                }
+            }
+
+            // Complete the coarse-fine interface interpolation by computing the
+            // normal extension. This uses latest interior values on fine patch
+            // but cached tangential values at the fine locations of the
+            // coarse-fine interface
+            d_U_cf_bdry_op->setPatchDataIndex(U_error_idx);
+            d_P_cf_bdry_op->setPatchDataIndex(P_error_idx);
+            const IntVector<NDIM>& ratio = level->getRatioToCoarserLevel();
+            for (PatchLevel<NDIM>::Iterator p(level); p; p++)
+            {
+                Pointer<Patch<NDIM> > patch = level->getPatch(p());
+                d_U_cf_bdry_op->computeNormalExtension(*patch, ratio, SIDEG);
+                d_P_cf_bdry_op->computeNormalExtension(*patch, ratio, CELLG);
+            }
+        }
+
+        // Smooth the error on the level.
+        Pointer<StaggeredStokesPETScLevelSolver> level_solver = d_level_solvers[level_num];
+        level_solver->setSolutionTime(d_solution_time);
+        level_solver->setTimeInterval(d_current_time, d_new_time);
+        level_solver->setComponentsHaveNullspace(d_has_velocity_nullspace, d_has_pressure_nullspace);
+
+        bool initial_guess_nonzero = true;
+        const KSP& petsc_ksp = level_solver->getPETScKSP();
+        KSPType ksp_type;
+        KSPGetType(petsc_ksp, &ksp_type);
+        if (!std::strcmp(ksp_type, "preonly")) initial_guess_nonzero = false;
+        level_solver->setInitialGuessNonzero(initial_guess_nonzero);
+
+        level_solver->solveSystem(*e_level, *r_level);
+    }
+    return;
+} // smoothError
+
+/////////////////////////////// PROTECTED ////////////////////////////////////
+
+void
+StaggeredStokesIBLevelRelaxationFACOperator::initializeOperatorStateSpecialized(
+    const SAMRAIVectorReal<NDIM, double>& /*solution*/,
+    const SAMRAIVectorReal<NDIM, double>& /*rhs*/,
+    const int coarsest_reset_ln,
+    const int finest_reset_ln)
+{
+    int ierr;
+
+    const double dt = d_new_time - d_current_time;
+    double kappa = std::numeric_limits<double>::quiet_NaN();
+    switch (d_time_stepping_type)
+    {
+    case BACKWARD_EULER:
+        kappa = 1.0;
+        break;
+    case TRAPEZOIDAL_RULE:
+    case MIDPOINT_RULE:
+        kappa = 0.5;
+        break;
+    default:
+        TBOX_ERROR("unsupported time stepping type\n");
+    }
+
+    // Construct patch level DOFs.
+    d_num_dofs_per_proc.resize(d_finest_ln + 1);
+    for (int ln = std::max(d_coarsest_ln, coarsest_reset_ln - 1); ln <= std::min(d_finest_ln, finest_reset_ln); ++ln)
+    {
+        // Allocate DOF index data.
+        Pointer<PatchLevel<NDIM> > level = d_hierarchy->getPatchLevel(ln);
+        if (!level->checkAllocated(d_u_dof_index_idx)) level->allocatePatchData(d_u_dof_index_idx);
+        if (!level->checkAllocated(d_p_dof_index_idx)) level->allocatePatchData(d_p_dof_index_idx);
+
+        // Construct DOF indices and SAMRAI to PETSc ordering.
+        StaggeredStokesPETScVecUtilities::constructPatchLevelDOFIndices(
+            d_num_dofs_per_proc[ln], d_u_dof_index_idx, d_p_dof_index_idx, level);
+    }
+
+    // Setup application ordering for the velocity and pressure DOFs.
+    d_u_p_app_ordering.resize(d_finest_ln + 1, nullptr);
+    std::vector<int> u_ao_offset(d_finest_ln + 1, 0);
+    std::vector<int> p_ao_offset(d_finest_ln + 1, 0);
+    for (int ln = std::max(d_coarsest_ln, coarsest_reset_ln - 1); ln <= std::min(d_finest_ln - 1, finest_reset_ln);
+         ++ln)
+    {
+        Pointer<PatchLevel<NDIM> > level = d_hierarchy->getPatchLevel(ln);
+        StaggeredStokesPETScVecUtilities::constructPatchLevelAO(d_u_p_app_ordering[ln],
+                                                                d_num_dofs_per_proc[ln],
+                                                                d_u_dof_index_idx,
+                                                                d_p_dof_index_idx,
+                                                                level,
+                                                                u_ao_offset[ln],
+                                                                p_ao_offset[ln]);
+    }
+
+    // Construct prolongation matrix and scaling for restriction matrix for various levels.
+    d_SAJ_prolongation_mat.resize(d_finest_ln + 1, nullptr);
+    d_scale_SAJ_restriction_mat.resize(d_finest_ln + 1, nullptr);
+    d_stokesib_prolongation_mat.resize(d_finest_ln + 1, nullptr);
+    d_scale_stokesib_restriction_mat.resize(d_finest_ln + 1, nullptr);
+    for (int ln = std::min(d_finest_ln - 1, finest_reset_ln); ln >= std::max(d_coarsest_ln, coarsest_reset_ln - 1);
+         --ln)
+    {
+        Pointer<PatchLevel<NDIM> > fine_level = d_hierarchy->getPatchLevel(ln + 1);
+        Pointer<PatchLevel<NDIM> > coarse_level = d_hierarchy->getPatchLevel(ln);
+        PETScMatUtilities::constructProlongationOp(d_SAJ_prolongation_mat[ln],
+                                                   d_u_petsc_prolongation_method,
+                                                   d_u_dof_index_idx,
+                                                   d_num_dofs_per_proc[ln + 1],
+                                                   d_num_dofs_per_proc[ln],
+                                                   fine_level,
+                                                   coarse_level,
+                                                   d_u_p_app_ordering[ln]);
+        PETScMatUtilities::constructRestrictionScalingOp(d_SAJ_prolongation_mat[ln], d_scale_SAJ_restriction_mat[ln]);
+
+        if (!d_rediscretize_stokes)
+        {
+            StaggeredStokesPETScMatUtilities::constructProlongationOp(d_stokesib_prolongation_mat[ln],
+                                                                      d_u_petsc_prolongation_method,
+                                                                      d_p_petsc_prolongation_method,
+                                                                      d_u_dof_index_idx,
+                                                                      d_p_dof_index_idx,
+                                                                      d_num_dofs_per_proc[ln + 1],
+                                                                      d_num_dofs_per_proc[ln],
+                                                                      fine_level,
+                                                                      coarse_level,
+                                                                      d_u_p_app_ordering[ln],
+                                                                      u_ao_offset[ln],
+                                                                      p_ao_offset[ln]);
+            PETScMatUtilities::constructRestrictionScalingOp(d_stokesib_prolongation_mat[ln],
+                                                             d_scale_stokesib_restriction_mat[ln]);
+        }
+    }
+
+    // Compute SAJ operator for various patch levels.
+    d_SAJ_mat.resize(d_finest_ln + 1, nullptr);
+    for (int ln = std::min(d_finest_ln, finest_reset_ln); ln >= std::max(d_coarsest_ln, coarsest_reset_ln - 1); --ln)
+    {
+        if (ln == d_finest_ln)
+        {
+            ierr = MatPtAP(d_A_mat, d_J_mat, MAT_INITIAL_MATRIX, d_SAJ_fill, &d_SAJ_mat[ln]);
+            IBTK_CHKERRQ(ierr);
+
+            // Compute the scale for the spreading operator.
+            Pointer<PatchLevel<NDIM> > finest_level = d_hierarchy->getPatchLevel(d_finest_ln);
+            Pointer<CartesianGridGeometry<NDIM> > grid_geom = d_hierarchy->getGridGeometry();
+            const double* const dx0 = grid_geom->getDx();
+            IntVector<NDIM> ratio = finest_level->getRatio();
+            double spread_scale = -kappa * kappa * dt;
+            for (unsigned d = 0; d < NDIM; ++d) spread_scale *= ratio(d) / dx0[d];
+            ierr = MatScale(d_SAJ_mat[ln], spread_scale);
+            IBTK_CHKERRQ(ierr);
+        }
+        else
+        {
+            ierr =
+                MatPtAP(d_SAJ_mat[ln + 1], d_SAJ_prolongation_mat[ln], MAT_INITIAL_MATRIX, d_SAJ_fill, &d_SAJ_mat[ln]);
+            IBTK_CHKERRQ(ierr);
+            ierr = MatDiagonalScale(d_SAJ_mat[ln], d_scale_SAJ_restriction_mat[ln], nullptr);
+            IBTK_CHKERRQ(ierr);
+        }
+    }
+
+    d_level_solvers.resize(d_finest_ln + 1);
+    d_galerkin_stokesib_mat.resize(d_finest_ln + 1, nullptr);
+    for (int ln = std::min(d_finest_ln, finest_reset_ln); ln >= std::max(d_coarsest_ln + 1, coarsest_reset_ln); --ln)
+    {
+        Pointer<StaggeredStokesPETScLevelSolver>& level_solver = d_level_solvers[ln];
+        if (!level_solver)
+        {
+            level_solver = StaggeredStokesSolverManager::getManager()->allocateSolver(
+                d_level_solver_type,
+                d_object_name + "::level_solver",
+                d_level_solver_db,
+                d_level_solver_default_options_prefix + std::to_string(ln) + "_");
+        }
+        level_solver->setSolutionTime(d_solution_time);
+        level_solver->setTimeInterval(d_current_time, d_new_time);
+        level_solver->setVelocityPoissonSpecifications(d_U_problem_coefs);
+        level_solver->setPhysicalBcCoefs(d_U_bc_coefs, d_P_bc_coef);
+        level_solver->setPhysicalBoundaryHelper(d_bc_helper);
+        level_solver->setMaxIterations(d_level_solver_max_iterations);
+        level_solver->setAbsoluteTolerance(d_level_solver_abs_residual_tol);
+        level_solver->setRelativeTolerance(d_level_solver_rel_residual_tol);
+        level_solver->setHomogeneousBc(true);
+        level_solver->setComponentsHaveNullspace(d_has_velocity_nullspace, d_has_pressure_nullspace);
+        level_solver->initializeSolverState(*getLevelSAMRAIVectorReal(*d_solution, ln),
+                                            *getLevelSAMRAIVectorReal(*d_rhs, ln));
+        const KSP& level_ksp = level_solver->getPETScKSP();
+        Mat level_mat, level_pc_mat;
+        ierr = KSPGetOperators(level_ksp, &level_mat, &level_pc_mat);
+        IBTK_CHKERRQ(ierr);
+        if (d_rediscretize_stokes || ln == d_finest_ln)
+        {
+            ierr = MatAXPY(level_mat, 1.0, d_SAJ_mat[ln], DIFFERENT_NONZERO_PATTERN);
+            IBTK_CHKERRQ(ierr);
+            ierr = KSPSetOperators(level_ksp, level_mat, level_mat);
+            IBTK_CHKERRQ(ierr);
+        }
+        else
+        {
+            TBOX_ASSERT(!d_rediscretize_stokes);
+            ierr = MatDestroy(&level_mat);
+            IBTK_CHKERRQ(ierr);
+            ierr = MatDestroy(&level_pc_mat);
+            IBTK_CHKERRQ(ierr);
+            ierr = KSPSetOperators(level_ksp, d_galerkin_stokesib_mat[ln], d_galerkin_stokesib_mat[ln]);
+            IBTK_CHKERRQ(ierr);
+        }
+
+        if (!d_rediscretize_stokes)
+        {
+            Mat level_mat;
+            ierr = KSPGetOperators(level_ksp, &level_mat, nullptr);
+            IBTK_CHKERRQ(ierr);
+            ierr = MatPtAP(level_mat,
+                           d_stokesib_prolongation_mat[ln - 1],
+                           MAT_INITIAL_MATRIX,
+                           d_RStokesIBP_fill,
+                           &d_galerkin_stokesib_mat[ln - 1]);
+            IBTK_CHKERRQ(ierr);
+            ierr = MatDiagonalScale(d_galerkin_stokesib_mat[ln - 1], d_scale_stokesib_restriction_mat[ln - 1], nullptr);
+            IBTK_CHKERRQ(ierr);
+        }
+    }
+
+    // Initialize the coarse level solver when needed.
+    if (d_coarse_solver_init_subclass && coarsest_reset_ln == d_coarsest_ln && d_coarse_solver_type != "LEVEL_SMOOTHER")
+    {
+        if (!d_coarse_solver)
+        {
+            d_coarse_solver =
+                StaggeredStokesSolverManager::getManager()->allocateSolver(d_coarse_solver_type,
+                                                                           d_object_name + "::coarse_solver",
+                                                                           d_coarse_solver_db,
+                                                                           d_coarse_solver_default_options_prefix);
+        }
+        d_coarse_solver->setSolutionTime(d_solution_time);
+        d_coarse_solver->setTimeInterval(d_current_time, d_new_time);
+        d_coarse_solver->setVelocityPoissonSpecifications(d_U_problem_coefs);
+        d_coarse_solver->setPhysicalBcCoefs(d_U_bc_coefs, d_P_bc_coef);
+        d_coarse_solver->setPhysicalBoundaryHelper(d_bc_helper);
+        d_coarse_solver->setMaxIterations(d_coarse_solver_max_iterations);
+        d_coarse_solver->setAbsoluteTolerance(d_coarse_solver_abs_residual_tol);
+        d_coarse_solver->setRelativeTolerance(d_coarse_solver_rel_residual_tol);
+        d_coarse_solver->setHomogeneousBc(true);
+        d_coarse_solver->setComponentsHaveNullspace(d_has_velocity_nullspace, d_has_pressure_nullspace);
+        d_coarse_solver->initializeSolverState(*getLevelSAMRAIVectorReal(*d_solution, d_coarsest_ln),
+                                               *getLevelSAMRAIVectorReal(*d_rhs, d_coarsest_ln));
+        Pointer<StaggeredStokesPETScLevelSolver> p_coarse_solver = d_coarse_solver;
+        if (p_coarse_solver)
+        {
+            const KSP& level_ksp = p_coarse_solver->getPETScKSP();
+            Mat level_mat, level_pc_mat;
+            ierr = KSPGetOperators(level_ksp, &level_mat, &level_pc_mat);
+            IBTK_CHKERRQ(ierr);
+            if (d_rediscretize_stokes)
+            {
+                ierr = MatAXPY(level_mat, 1.0, d_SAJ_mat[d_coarsest_ln], DIFFERENT_NONZERO_PATTERN);
+                IBTK_CHKERRQ(ierr);
+                ierr = KSPSetOperators(level_ksp, level_mat, level_mat);
+                IBTK_CHKERRQ(ierr);
+            }
+            else
+            {
+                TBOX_ASSERT(!d_rediscretize_stokes);
+                ierr = MatDestroy(&level_mat);
+                IBTK_CHKERRQ(ierr);
+                ierr = MatDestroy(&level_pc_mat);
+                IBTK_CHKERRQ(ierr);
+                ierr = KSPSetOperators(
+                    level_ksp, d_galerkin_stokesib_mat[d_coarsest_ln], d_galerkin_stokesib_mat[d_coarsest_ln]);
+                IBTK_CHKERRQ(ierr);
+            }
+        }
+        else
+        {
+            TBOX_ERROR("no mechanism for specifying IB part of Stokes-IB operator!");
+        }
+    }
+    d_level_solvers[d_coarsest_ln] = d_coarse_solver;
+
+    // Get overlap information for setting patch boundary conditions.
+    d_patch_side_bc_box_overlap.resize(d_finest_ln + 1);
+    for (int ln = coarsest_reset_ln; ln <= finest_reset_ln; ++ln)
+    {
+        Pointer<PatchLevel<NDIM> > level = d_hierarchy->getPatchLevel(ln);
+        const int num_local_patches = level->getProcessorMapping().getLocalIndices().getSize();
+        d_patch_side_bc_box_overlap[ln].resize(num_local_patches);
+        int patch_counter = 0;
+        for (PatchLevel<NDIM>::Iterator p(level); p; p++, ++patch_counter)
+        {
+            Pointer<Patch<NDIM> > patch = level->getPatch(p());
+            const Box<NDIM>& patch_box = patch->getBox();
+            for (unsigned int axis = 0; axis < NDIM; ++axis)
+            {
+                const Box<NDIM> side_box = SideGeometry<NDIM>::toSideBox(patch_box, axis);
+                const Box<NDIM> side_ghost_box = Box<NDIM>::grow(side_box, 1);
+                d_patch_side_bc_box_overlap[ln][patch_counter][axis] = BoxList<NDIM>(side_ghost_box);
+                d_patch_side_bc_box_overlap[ln][patch_counter][axis].removeIntersections(side_box);
+            }
+        }
+    }
+
+    d_patch_cell_bc_box_overlap.resize(d_finest_ln + 1);
+    for (int ln = coarsest_reset_ln; ln <= finest_reset_ln; ++ln)
+    {
+        Pointer<PatchLevel<NDIM> > level = d_hierarchy->getPatchLevel(ln);
+
+        const int num_local_patches = level->getProcessorMapping().getLocalIndices().getSize();
+        d_patch_cell_bc_box_overlap[ln].resize(num_local_patches);
+
+        int patch_counter = 0;
+        for (PatchLevel<NDIM>::Iterator p(level); p; p++, ++patch_counter)
+        {
+            Pointer<Patch<NDIM> > patch = level->getPatch(p());
+            const Box<NDIM>& patch_box = patch->getBox();
+            const Box<NDIM>& ghost_box = Box<NDIM>::grow(patch_box, 1);
+            d_patch_cell_bc_box_overlap[ln][patch_counter] = BoxList<NDIM>(ghost_box);
+            d_patch_cell_bc_box_overlap[ln][patch_counter].removeIntersections(patch_box);
+        }
+    }
+
+    return;
+} // initializeOperatorStateSpecialized
+
+void
+StaggeredStokesIBLevelRelaxationFACOperator::deallocateOperatorStateSpecialized(const int coarsest_reset_ln,
+                                                                                const int finest_reset_ln)
+{
+    int ierr;
+
+    // Deallocate level solvers and overlap boxes for side and cell data.
+    if (d_coarse_solver == d_level_solvers[d_coarsest_ln]) d_coarse_solver.setNull();
+    for (int ln = coarsest_reset_ln; ln <= std::min(d_finest_ln, finest_reset_ln); ++ln)
+    {
+        if (d_level_solvers[ln]) d_level_solvers[ln]->deallocateSolverState();
+        d_patch_side_bc_box_overlap[ln].resize(0);
+        d_patch_cell_bc_box_overlap[ln].resize(0);
+    }
+
+    // Deallocate application ordering.
+    for (int ln = std::max(d_coarsest_ln, coarsest_reset_ln - 1); ln <= std::min(d_finest_ln - 1, finest_reset_ln);
+         ++ln)
+    {
+        ierr = AODestroy(&d_u_p_app_ordering[ln]);
+        IBTK_CHKERRQ(ierr);
+        d_u_p_app_ordering[ln] = nullptr;
+    }
+
+    // Deallocate prolongation mat and restriction scaling Mat.
+    for (int ln = std::min(d_finest_ln - 1, finest_reset_ln); ln >= std::max(d_coarsest_ln, coarsest_reset_ln - 1);
+         --ln)
+    {
+        ierr = MatDestroy(&d_SAJ_prolongation_mat[ln]);
+        IBTK_CHKERRQ(ierr);
+        d_SAJ_prolongation_mat[ln] = nullptr;
+
+        ierr = VecDestroy(&d_scale_SAJ_restriction_mat[ln]);
+        IBTK_CHKERRQ(ierr);
+        d_scale_SAJ_restriction_mat[ln] = nullptr;
+
+        ierr = MatDestroy(&d_stokesib_prolongation_mat[ln]);
+        IBTK_CHKERRQ(ierr);
+        d_stokesib_prolongation_mat[ln] = nullptr;
+
+        ierr = VecDestroy(&d_scale_stokesib_restriction_mat[ln]);
+        IBTK_CHKERRQ(ierr);
+        d_scale_stokesib_restriction_mat[ln] = nullptr;
+    }
+
+    // Deallocate SAJ and Galerkin Stokes-IB Mat.
+    for (int ln = std::min(d_finest_ln, finest_reset_ln); ln >= std::max(d_coarsest_ln, coarsest_reset_ln - 1); --ln)
+    {
+        ierr = MatDestroy(&d_SAJ_mat[ln]);
+        IBTK_CHKERRQ(ierr);
+        d_SAJ_mat[ln] = nullptr;
+
+        ierr = MatDestroy(&d_galerkin_stokesib_mat[ln]);
+        IBTK_CHKERRQ(ierr);
+        d_galerkin_stokesib_mat[ln] = nullptr;
+    }
+
+    // Deallocate DOF index data.
+    for (int ln = std::max(d_coarsest_ln, coarsest_reset_ln - 1); ln <= std::min(d_finest_ln, finest_reset_ln); ++ln)
+    {
+        Pointer<PatchLevel<NDIM> > level = d_hierarchy->getPatchLevel(ln);
+        if (level->checkAllocated(d_u_dof_index_idx)) level->deallocatePatchData(d_u_dof_index_idx);
+        if (level->checkAllocated(d_p_dof_index_idx)) level->deallocatePatchData(d_p_dof_index_idx);
+    }
+    return;
+} // deallocateOperatorStateSpecialized
+
+/////////////////////////////// PRIVATE //////////////////////////////////////
+
+//////////////////////////////////////////////////////////////////////////////
+
+} // namespace IBAMR
+
+//////////////////////////////////////////////////////////////////////////////

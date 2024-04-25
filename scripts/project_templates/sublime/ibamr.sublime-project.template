@@ -1,0 +1,68 @@
+{
+    "build_systems":
+    [
+        {
+            "file_regex": "^(..[^:\n]*):([0-9]+):?([0-9]+)?:? (.*)$",
+            "keyfiles":
+            [
+                "Makefile",
+                "makefile"
+            ],
+            "name": "IBAMR",
+            "selector": "source.makefile",
+            "shell_cmd": "make -kw",
+            "syntax": "make_output.sublime-syntax",
+            "variants":
+            [
+                {
+                    "name": "j8",
+                    "shell_cmd": "make -kwj8"
+                },
+                {
+                    "name": "clean",
+                    "shell_cmd": "make -kw clean"
+                },
+                {
+                    "name": "examples",
+                    "shell_cmd": "make -kw examples"
+                },
+                {
+                    "name": "examples j8",
+                    "shell_cmd": "make -kwj8 examples"
+                }
+            ],
+            "working_dir": "${project_path}/../ibamr-objs-dbg"
+        }
+    ],
+    "folders":
+    [
+        {
+            "path": "."
+        }
+    ],
+    "settings":
+    {
+        "LSP":
+        {
+            "clangd":
+            {
+                "command":
+                [
+                    "/usr/local/opt/llvm/bin/clangd",
+                    "--background-index",
+                    "--clang-tidy",
+                    "--completion-parse=auto",
+                    "--completion-style=detailed",
+                    "--header-insertion=iwyu",
+                    "--pch-storage=memory",
+                ],
+                "enabled": true
+            }
+        },
+        "compile_commands": "${project_path}",
+        "indent_to_bracket": true,
+        "show_definitions": false,
+        "tab_size": 4,
+        "translate_tabs_to_spaces": true
+    }
+}
